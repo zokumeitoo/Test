@@ -1,0 +1,306 @@
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include "cufft.h"
+#include <stdio.h>
+#include <sys/time.h>
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <algorithm>
+
+#define pi 3.14159265
+
+using namespace std;
+using namespace cv;
+
+// 实数与复数之间的互相转换。
+__global__ void RToC(int size, float* input, float2* output)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < size)
+	{
+		output[i].x = input[i];
+		output[i].y = 0;
+	}
+}
+
+__global__ void CToR(int size, float2* input, float* output)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < size)
+	{
+		output[i] = input[i].x;
+	}
+}
+
+//用于逆变换之后的尺度放缩
+template <class T>
+__global__
+void Scale(int size, T* input, float scale)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < size)
+	{
+		input[i] *= scale;
+	}
+}
+
+double cpuSecond() 
+{ 
+	return clock(); 
+}
+
+int main(int aegc, char** argv)
+{
+	double t_cpu = getTickCount();
+	//读取图片数据，得到nx(Width)和ny(Height)
+	Mat Rawimage = imread("1.jpg", 0);
+	int Height = Rawimage.rows;
+	int Width = Rawimage.cols;
+	int all=Height*Width;
+	double ptr = 2 * pi * 500;
+	Mat Firimg = Rawimage;
+	imshow("Rawimage", Rawimage);		//显示原图（灰度图0-255）
+	Firimg.convertTo(Firimg, CV_32F, 1.0f / 255);
+	imshow("Firimg", Firimg);			//显示原图（灰度图0-1）
+
+	//测试用
+	uchar a = Rawimage.at<uchar>(1, 0);
+	uchar x = Rawimage.at<uchar>(0, 0);
+	uchar y = Rawimage.at<uchar>(0, 6);
+	uchar z = Rawimage.at<uchar>(0, 818);
+	std::cout << int(a) << std::endl;
+	std::cout << int(x) << std::endl;
+	std::cout << int(y) << std::endl;
+	std::cout << int(z) << std::endl;
+	std::cout << Firimg.at<float>(1, 0) << std::endl;
+	std::cout << Firimg.at<float>(0, 0) << std::endl;
+	std::cout << Firimg.at<float>(0, 6) << std::endl;
+	std::cout << Firimg.at<float>(0, 818) << std::endl;
+	std::cout << Height << " " << Width << " " << Width / 2 + 1<<std::endl;
+
+	float* host_data, *finaldata;//存储原始数据和逆变换后的数据(主机)
+	float* device_data, *ifftdata_f;//存储拷贝的原始数据和逆变换后的数据(设备)
+	cufftComplex* fftRes, *fftRes_phaseshift;//将fft变换后的数据复制到主机端以显示频谱图、进行移相用（在主机端显示移相后的频谱图)
+	cufftComplex* fftdata, *ifftdata, *res;//存储数据类型转换后的原始数据和变换后的数据（设备端）、反变换后的数据、备份存储变换后的数据（设备端）
+	
+	host_data = (float*)malloc(Height * Width * sizeof(float));
+	//复制原图的像素点值
+	for (int i = 0; i < Height; i++)
+	{
+		float* ptrs = Firimg.ptr<float>(i);
+		for (int j = 0; j < Width; j++)
+		{
+			host_data[i * Width + j] = ptrs[j];
+		}	
+	}
+	finaldata = (float*)malloc(Height * Width * sizeof(float));
+	fftRes = (cufftComplex*)malloc(sizeof(cufftComplex) * Height * Width);		//将fft变换后的数据复制到主机端以显示频谱图
+	fftRes_phaseshift = (cufftComplex*)malloc(sizeof(cufftComplex) * Height * Width);		//进行移相用（在主机端显示移相后的频谱图
+	cudaMalloc((float**)& device_data, Height * Width * sizeof(float));
+	cudaMalloc((float**)& ifftdata_f, Height * Width * sizeof(float));
+	cudaMalloc((void**)& fftdata, Height * Width * sizeof(cufftComplex));
+	cudaMalloc((void**)& ifftdata, Height * Width * sizeof(cufftComplex));
+	cudaMalloc((void**)& res, Height * Width * sizeof(cufftComplex));
+
+	float sum = 0;//测试，(0,0)频率域等于所有像素点之和
+	float real_1= 0;//测试，(0,6)频率域的实部
+	float imag_1= 0;//测试，(0,6)频率域的虚部
+	float real_2 = 0;//测试，(1,0)频率域的实部
+	float imag_2 = 0;//测试，(1,0)频率域的实部
+	for (int k = 0; k < Height*Width; k++)
+	{
+		sum = sum + host_data[k];
+	}
+	for (int m = 0; m < Height; m++)
+	{
+		for (int n = 0; n < Width; n++)
+		{
+			real_1= real_1 + host_data[m*Width + n]*cos(2 * pi * 6 * n / Width);
+			imag_1= imag_1 - host_data[m*Width + n] * sin(2 * pi * 6 * n / Width);
+			real_2 = real_2 + host_data[m*Width + n] * cos(2 * pi * 0 * m / Height+2 * pi * 818 * n / Width);
+			imag_2 = imag_2 - host_data[m*Width + n] * sin(2 * pi * 0 * m / Height + 2 * pi * 818 * n / Width);
+		}
+	}
+	std::cout << std::endl;
+	std::cout << sum << std::endl;
+	std::cout << host_data[1 * Width]<< std::endl;
+	std::cout << host_data[0] << std::endl;
+	std::cout << host_data[6] << std::endl;
+	std::cout << host_data[818] << std::endl;
+	std::cout << real_1 << "   " << imag_1 <<std::endl;
+	std::cout << real_2 << "   " << imag_2 << std::endl;
+
+	cudaMemcpy(device_data, host_data, Height * Width * sizeof(float), cudaMemcpyHostToDevice);
+
+	int block = 128;
+	int grid = nx / 128 + 1;
+	double t1 = getTickCount();
+	RToC<<<grid, block>>>(all, device_data, fftdata);//float转换成cufftComplex
+	cudaDeviceSynchronize();
+	t1 = 1000 * ((double)getTickCount() - t1) / getTickFrequency();
+	cufftHandle planFwd;
+	cufftHandle planInv;
+	cufftPlan2d(&planFwd, Height, Width, CUFFT_C2C);
+	cufftPlan2d(&planInv, Height, Width, CUFFT_C2C);
+	//正变换
+	double t2 = getTickCount();
+	cufftExecC2C(planFwd, fftdata, fftdata, CUFFT_FORWARD);
+	cudaDeviceSynchronize();
+	t2 = 1000 * ((double)getTickCount() - t2) / getTickFrequency();
+	cudaMemcpy(fftRes, fftdata, Height * Width * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
+	cudaMemcpy(fftRes_phaseshift, fftdata, Height * Width * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
+	
+	std::cout << std::endl;
+	std::cout << fftRes[0].x<<"   "<<fftRes[0].y<< std::endl;
+
+	std::cout << fftRes[6].x << std::endl;
+	std::cout << fftRes[6].y << std::endl;
+	std::cout << "fftRes[818].x:"<<fftRes[818].x << std::endl;
+	std::cout << "fftRes[818].y:" << fftRes[818].y << std::endl;
+	std::cout << cos(ptr) << std::endl;
+	std::cout << sin(ptr) << std::endl;
+	std::cout << fftRes[6].x*cos(ptr)- fftRes[6].y *sin(ptr)<< std::endl;
+	std::cout << fftRes[6].y*cos(ptr)+ fftRes[6].x*sin(ptr)<< std::endl;
+	/*int all = Height * (Width / 2 + 1);
+	float* tmp_x = (float*)malloc(all * sizeof(float));
+	float* tmp_y = (float*)malloc(all * sizeof(float));
+	for (int k= 0; k < all; k++)
+	{
+		tmp_x[k] = dftRes_phaseshift[k].x;
+		tmp_y[k] = dftRes_phaseshift[k].y;
+	}
+	std::cout << tmp_x[6] << "  " << tmp_y[6] << std::endl;
+	float max_tmp_x = *max_element(tmp_x, tmp_x + all);
+	float min_tmp_x = *min_element(tmp_x, tmp_x + all);
+	float max_tmp_y = *max_element(tmp_y, tmp_y + all);
+	float min_tmp_y = *min_element(tmp_y, tmp_y + all);
+	std::cout << max_tmp_x << "   " << min_tmp_x << std::endl;
+	std::cout << max_tmp_y << "   " << min_tmp_y << std::endl;*/
+	for (int j = 0; j < all; j++)
+	{
+		fftRes_phaseshift[j].x = fftRes_phaseshift[j].x*cos(ptr) - fftRes_phaseshift[j].y*sin(ptr);
+		fftRes_phaseshift[j].y = fftRes_phaseshift[j].y*cos(ptr) + fftRes_phaseshift[j].x*sin(ptr);
+	}
+	//std::cout << tmp_x[6] << "   " << tmp_y[6] << std::endl;
+	std::cout << dftRes_phaseshift[6].x << std::endl;
+	std::cout << dftRes_phaseshift[6].y << std::endl;
+
+	//for (int k = 0;k < Height; k++) {
+	//	for (int l = 0; l < Width / 2 + 1; l++) {
+	//		int index=k*Height + l;
+	//		dftRes[index].x= dftRes[index].x*cos(ptr);
+	//		dftRes[index].y = dftRes[index].y*sin(ptr);
+	//	}
+	//}
+	//cudaMemcpy(dftRes, res, Height * (Width/2) * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
+
+	//float *RedftRes = (float *)malloc(Height * (Width ) * sizeof(float));
+	//求频谱图
+	for(int height=0; height<Height; height++)
+	{
+		for(int width=0; width<Width; width++)
+		{
+			int index=height*Width+width;
+			fftRes[index]=log(pow((pow(fftRes[index].x, 2) + pow(fftRes[index].y, 2)), 0.5) + 1.0);
+		}
+	}
+	/*float *RedftRes = (float *)malloc(Height * (Width) * sizeof(float));
+	const int last_index = Height*(Width / 2 + 1);
+	const int new_width = Width / 2 + 1;
+	int src_index, dst_index;
+	for (int height = 0; height<Height; height++) {
+		for (int width = 0; width<Width; width++) {
+			src_index = width + height*Width;
+			if (width<new_width) {
+				dst_index = width + height*new_width;
+			}
+			else {
+				dst_index = Width - width + (Height - 1 - height)*new_width;
+			}
+			RedftRes[src_index] = log(pow((pow(dftRes[dst_index].x, 2) + pow(dftRes[dst_index].y, 2)), 0.5) + 1.0);
+		}
+	}*/
+	
+	Mat spec = Mat(Height, Width, CV_32FC1, fftRes);
+	std::cout << spec.at<float>(0, 1) << std::endl;
+	normalize(spec, spec, 0, 1, NORM_MINMAX);
+	std::cout << spec.at<float>(0, 1) << std::endl;
+	/*Mat afres = Mat(Height, Width, CV_32FC1, RedftRes);
+	normalize(afres, afres, 0, 1, NORM_MINMAX);*/
+	int cx = spec.cols / 2;
+	int cy = spec.rows / 2;
+	Mat q0(spec, Rect(0, 0, cx, cy));//ROI区域的左上
+	Mat q1(spec, Rect(cx, 0, cx, cy));//ROI区域的右上
+	Mat q2(spec, Rect(0, cy, cx, cy));//ROI区域的左下
+	Mat q3(spec, Rect(cx, cy, cx, cy));//ROI区域的右下
+
+	Mat tmp;
+	q0.copyTo(tmp);
+	q3.copyTo(q0);
+	tmp.copyTo(q3);
+	//交换象限(右上与左下）
+	q1.copyTo(tmp);
+	q2.copyTo(q1);
+	tmp.copyTo(q2);
+
+	for (int row = 0; row<1; row++)
+	{
+		std::cout << spec.at<float>(row, 0) << std::endl;
+	}
+	std::cout << spec.type() << std::endl;
+	imshow("spec", spec);
+
+	spec.convertTo(spec, CV_8U, 255);		//恢复到灰度图
+	imwrite("out.jpg", spec);
+	//waitKey(6000);
+	//逆变换		
+	cudaMemcpy(ifftdata, fftRes_phaseshift, Height * Width * sizeof(cufftComplex), cudaMemcpyHostToDevice);//将移相后的数据传入设备端
+	double t3 = getTickCount();
+	cufftExecC2C(planInv, ifftdata, ifftdata, CUFFT_INVERSE);
+	RToC<<<grid, block>>>(all, ifftdata, ifftdata_f);//cufftComplex转换成float
+	Scale<<<block, thread>>>(all, ifftdata_f, 1.0f / all);
+	cudaDeviceSynchronize();
+	t3 = 1000 * ((double)getTickCount() - t3) / getTickFrequency();
+	cudaMemcpy(finaldata, ifftdata, Height * Width * sizeof(float), cudaMemcpyDeviceToHost);
+	std::cout << std::endl;
+	std::cout << "finaldata: "<<finaldata[1 * Width] //*(Width*Height)*/<< std::endl;
+
+	
+
+	Mat gpu_res = Mat(Height, Width, CV_32FC1, dftRes);//是把x和y顺次填入
+	std::cout << gpu_res.at<float>(0, 3) << std::endl;
+	normalize(gpu_res, gpu_res, 0, 1, NORM_MINMAX);
+	Mat gpu_back = Mat(Height, Width, CV_32FC1, finaldata);
+	normalize(gpu_back, gpu_back, 0, 1, NORM_MINMAX);
+	std::cout << gpu_back.at<float>(1, 0) << std::endl;
+	gpu_back.convertTo(gpu_back, CV_8U, 255);
+	uchar b = gpu_back.at<uchar>(1, 0);
+	std::cout << int(b) << std::endl;
+	imshow("gpu_res:", gpu_res);
+	imshow("gpu_back:", gpu_back);
+	//normalize(gpures, gpures, 0, 1, NORM_MINMAX);
+	waitKey(60000);
+
+	//GPU的时间
+	double t_gpu = t1+t2+t3;
+	std::cout << "Cuda Time=" << t_gpu << " ms" << std::endl;
+	//use  CPU	
+	t_cpu = 1000 * ((double)getTickCount() - t_cpu) / getTickFrequency() - t_gpu;
+	std::cout << "CPU Time=" << t_cpu << " ms" << std::endl;	
+
+	cufftDestroy(planFwd);
+	cufftDestroy(planInv);
+	cudaFree(res);
+	cudaFree(device_data);
+	cudaFree(fftdata);
+	cudaFree(ifftdata);
+	cudaFree(ifftdata_f);
+	free(host_data);
+	free(finaldata);
+	free(fftRes);
+	free(fftRes_phaseshift);
+	waitKey(600000);
+
+	return 0;
+}
